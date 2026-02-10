@@ -1,0 +1,221 @@
+---
+# Ansible Playbook for Server Provisioning
+# Usage: ansible-playbook -i inventory.ini provision-server.yml
+
+- name: Provision and Harden Linux Server
+  hosts: webservers
+  become: yes
+  vars:
+    admin_username: sysadmin
+    ssh_port: 2222
+    allowed_ssh_users:
+      - sysadmin
+
+  tasks:
+    - name: Update all packages (Debian/Ubuntu)
+      apt:
+        update_cache: yes
+        upgrade: dist
+        autoremove: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Update all packages (RHEL/CentOS)
+      dnf:
+        name: "*"
+        state: latest
+      when: ansible_os_family == "RedHat"
+    
+    - name: Install essential packages (Debian/Ubuntu)
+      apt:
+        name:
+          - vim
+          - curl
+          - wget
+          - git
+          - net-tools
+          - htop
+          - fail2ban
+          - ufw
+        state: present
+      when: ansible_os_family == "Debian"
+    
+    - name: Install essential packages (RHEL/CentOS)
+      dnf:
+        name:
+          - vim
+          - curl
+          - wget
+          - git
+          - net-tools
+          - htop
+          - fail2ban
+          - firewalld
+        state: present
+      when: ansible_os_family == "RedHat"
+    
+    - name: Create admin user
+      user:
+        name: "{{ admin_username }}"
+        shell: /bin/bash
+        groups: "{{ 'sudo' if ansible_os_family == 'Debian' else 'wheel' }}"
+        append: yes
+        create_home: yes
+        state: present
+    
+    - name: Set password for admin user
+      user:
+        name: "{{ admin_username }}"
+        password: "{{ 'ChangeMe123!' | password_hash('sha512') }}"
+        update_password: on_create
+    
+    - name: Create .ssh directory for admin user
+      file:
+        path: "/home/{{ admin_username }}/.ssh"
+        state: directory
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0700'
+    
+    - name: Configure SSH - backup original config
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: "/etc/ssh/sshd_config.backup.{{ ansible_date_time.date }}"
+        remote_src: yes
+        force: no
+    
+    - name: Configure SSH settings
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?Port', line: 'Port {{ ssh_port }}' }
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication yes' }
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
+      notify: Restart SSH
+    
+    - name: Configure firewall (UFW - Debian/Ubuntu)
+      block:
+        - name: Enable UFW
+          ufw:
+            state: enabled
+            policy: deny
+        
+        - name: Allow SSH on custom port
+          ufw:
+            rule: allow
+            port: "{{ ssh_port }}"
+            proto: tcp
+        
+        - name: Allow HTTP
+          ufw:
+            rule: allow
+            port: '80'
+            proto: tcp
+        
+        - name: Allow HTTPS
+          ufw:
+            rule: allow
+            port: '443'
+            proto: tcp
+      when: ansible_os_family == "Debian"
+    
+    - name: Configure firewall (firewalld - RHEL/CentOS)
+      block:
+        - name: Start and enable firewalld
+          systemd:
+            name: firewalld
+            state: started
+            enabled: yes
+        
+        - name: Allow SSH on custom port
+          firewalld:
+            port: "{{ ssh_port }}/tcp"
+            permanent: yes
+            state: enabled
+        
+        - name: Allow HTTP
+          firewalld:
+            service: http
+            permanent: yes
+            state: enabled
+        
+        - name: Allow HTTPS
+          firewalld:
+            service: https
+            permanent: yes
+            state: enabled
+        
+        - name: Reload firewalld
+          command: firewall-cmd --reload
+      when: ansible_os_family == "RedHat"
+    
+    - name: Configure fail2ban
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 5
+          
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+      notify: Restart fail2ban
+    
+    - name: Enable and start fail2ban
+      systemd:
+        name: fail2ban
+        state: started
+        enabled: yes
+    
+    - name: Configure automatic updates (Debian/Ubuntu)
+      apt:
+        name: unattended-upgrades
+        state: present
+      when: ansible_os_family == "Debian"
+    
+    - name: Configure automatic updates (RHEL/CentOS)
+      block:
+        - name: Install dnf-automatic
+          dnf:
+            name: dnf-automatic
+            state: present
+        
+        - name: Enable dnf-automatic timer
+          systemd:
+            name: dnf-automatic.timer
+            state: started
+            enabled: yes
+      when: ansible_os_family == "RedHat"
+    
+    - name: Set timezone
+      timezone:
+        name: UTC
+    
+    - name: Configure NTP
+      systemd:
+        name: "{{ 'systemd-timesyncd' if ansible_os_family == 'Debian' else 'chronyd' }}"
+        state: started
+        enabled: yes
+    
+    - name: Create provisioning report
+      template:
+        src: provision-report.j2
+        dest: /root/provision-report.txt
+        mode: '0600'
+  
+  handlers:
+    - name: Restart SSH
+      systemd:
+        name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+        state: restarted
+    
+    - name: Restart fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted
